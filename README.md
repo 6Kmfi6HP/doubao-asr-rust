@@ -1,0 +1,35 @@
+[package]
+name = "doubao-asr"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.86"
+description = "Unofficial Rust SDK and CLI for Doubao IME ASR"
+license = "MIT"
+repository = "https://github.com/6Kmfi6HP/doubao-asr-rust"
+keywords = ["asr", "speech-to-text", "doubao"]
+categories = ["api-bindings", "multimedia::audio"]
+
+[lib]
+name = "doubao_asr"
+
+[[bin]]
+name = "doubao-asr"
+path = "src/bin/doubao-asr.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+dirs = "6.0"
+futures-util = "0.3"
+md5 = "0.7"
+rand = "0.9"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1.44", features = ["fs", "io-util", "io-std", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+url = "2.5"
+uuid = { version = "1.16", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3.19"
