@@ -1,0 +1,275 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release tag to rebuild, for example v0.2.0
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  quality:
+    name: Quality gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.sha }}
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: cargo fmt --all -- --check
+      - run: cargo test --all-targets
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo build --release --locked
+      - name: Build and smoke-test the container
+        shell: bash
+        run: |
+          set -euo pipefail
+          image=doubao-asr:ci
+          volume=doubao-asr-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}
+          container=doubao-asr-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}
+          cleanup() {
+            docker rm -f "$container" >/dev/null 2>&1 || true
+            docker volume rm "$volume" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          docker build --build-arg VERSION=ci --build-arg VCS_REF="$GITHUB_SHA" -t "$image" .
+          test "$(docker image inspect --format '{{.Config.User}}' "$image")" = "10001:10001"
+          docker run --rm --entrypoint ffmpeg "$image" -hide_banner -encoders 2>&1 | grep -q libopus
+
+          docker volume create "$volume" >/dev/null
+          docker run --rm --entrypoint sh -v "$volume:/data" "$image" -c 'echo persisted > /data/probe'
+          test "$(docker run --rm --entrypoint cat -v "$volume:/data" "$image" /data/probe)" = persisted
+
+          docker run -d --name "$container" --read-only --tmpfs /tmp:size=128m,mode=1777 \
+            -v "$volume:/data" -p 127.0.0.1::8000 "$image" >/dev/null
+          port=$(docker port "$container" 8000/tcp | sed 's/.*://')
+          for attempt in {1..30}; do
+            if curl --fail --silent "http://127.0.0.1:${port}/healthz" >/dev/null; then
+              break
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              docker logs "$container"
+              exit 1
+            fi
+            sleep 1
+          done
+          docker stop --time 20 "$container" >/dev/null
+          docker logs "$container" 2>&1 | grep -q 'shutdown signal received'
+
+  release:
+    name: Prepare release
+    if: github.event_name == 'push'
+    needs: quality
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+      version: ${{ steps.release.outputs.version }}
+      sha: ${{ steps.release.outputs.sha }}
+    steps:
+      - id: release
+        uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  release-info:
+    name: Resolve release
+    if: always() && needs.quality.result == 'success' && (needs.release.result == 'success' || needs.release.result == 'skipped')
+    needs:
+      - quality
+      - release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      publish: ${{ steps.info.outputs.publish }}
+      tag: ${{ steps.info.outputs.tag }}
+      version: ${{ steps.info.outputs.version }}
+      sha: ${{ steps.info.outputs.sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - id: info
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          MANUAL_TAG: ${{ inputs.release_tag }}
+          RELEASE_CREATED: ${{ needs.release.outputs.release_created }}
+          RELEASE_TAG: ${{ needs.release.outputs.tag_name }}
+          RELEASE_VERSION: ${{ needs.release.outputs.version }}
+          RELEASE_SHA: ${{ needs.release.outputs.sha }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = workflow_dispatch ]; then
+            tag=$MANUAL_TAG
+            if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "release_tag must match vX.Y.Z" >&2
+              exit 1
+            fi
+            gh release view "$tag" >/dev/null
+            git fetch --force origin "refs/tags/$tag:refs/tags/$tag"
+            version=${tag#v}
+            sha=$(git rev-list -n 1 "$tag")
+            publish=true
+          elif [ "$RELEASE_CREATED" = true ]; then
+            tag=$RELEASE_TAG
+            version=$RELEASE_VERSION
+            sha=$RELEASE_SHA
+            publish=true
+          else
+            tag=
+            version=
+            sha=
+            publish=false
+          fi
+          {
+            echo "publish=$publish"
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "sha=$sha"
+          } >> "$GITHUB_OUTPUT"
+
+  binaries:
+    name: Binary (${{ matrix.asset_arch }})
+    if: needs.release-info.outputs.publish == 'true'
+    needs: release-info
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            asset_arch: x86_64
+          - platform: linux/arm64
+            asset_arch: aarch64
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.release-info.outputs.tag }}
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Export static binaries
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: docker buildx build --platform "$PLATFORM" --target artifacts --output type=local,dest=dist .
+      - name: Package binaries
+        env:
+          VERSION: ${{ needs.release-info.outputs.version }}
+          ASSET_ARCH: ${{ matrix.asset_arch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          file dist/doubao-asr dist/doubao-asr-server | tee binary-types.txt
+          grep -q 'statically linked' binary-types.txt
+          package="doubao-asr-v${VERSION}-linux-${ASSET_ARCH}-musl"
+          mkdir "$package"
+          install -m 0755 dist/doubao-asr dist/doubao-asr-server "$package/"
+          install -m 0644 README.md LICENSE "$package/"
+          tar -czf "${package}.tar.gz" "$package"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: binaries-${{ matrix.asset_arch }}
+          path: doubao-asr-v*-linux-${{ matrix.asset_arch }}-musl.tar.gz
+          if-no-files-found: error
+
+  image:
+    name: Container image
+    if: needs.release-info.outputs.publish == 'true'
+    needs: release-info
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.release-info.outputs.tag }}
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: metadata
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ghcr.io/6kmfi6hp/doubao-asr-rust
+          tags: |
+            type=semver,pattern={{version}},value=${{ needs.release-info.outputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.release-info.outputs.tag }}
+            type=raw,value=latest
+      - id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          target: runtime
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          build-args: |
+            VERSION=${{ needs.release-info.outputs.version }}
+            VCS_REF=${{ needs.release-info.outputs.sha }}
+            SOURCE=${{ github.server_url }}/${{ github.repository }}
+          cache-from: type=gha,scope=release-image
+          cache-to: type=gha,mode=max,scope=release-image
+          provenance: mode=max
+          sbom: true
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-name: ghcr.io/6kmfi6hp/doubao-asr-rust
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+  release-assets:
+    name: Release assets
+    if: needs.release-info.outputs.publish == 'true'
+    needs:
+      - release-info
+      - binaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: binaries-*
+          path: dist
+          merge-multiple: true
+      - name: Upload assets and checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.release-info.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum doubao-asr-v*-linux-*-musl.tar.gz > SHA256SUMS
+          gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+            doubao-asr-v*-linux-*-musl.tar.gz SHA256SUMS

@@ -134,8 +134,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn shutdown_signal() {
-    if tokio::signal::ctrl_c().await.is_err() {
-        std::future::pending::<()>().await;
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("failed to install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
     }
+
+    #[cfg(not(unix))]
+    let _ = tokio::signal::ctrl_c().await;
+
     tracing::info!("shutdown signal received");
 }

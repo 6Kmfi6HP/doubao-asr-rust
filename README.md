@@ -20,6 +20,48 @@ cargo build --release
 cargo test --all-targets
 ```
 
+## Docker
+
+Prebuilt `linux/amd64` and `linux/arm64` images are published to GitHub
+Container Registry:
+
+```bash
+docker run --rm -p 127.0.0.1:8000:8000 \
+  -e DOUBAO_ASR_API_KEY=change-me \
+  -v doubao-asr-data:/data \
+  ghcr.io/6kmfi6hp/doubao-asr-rust:latest
+```
+
+The image runs as UID/GID `10001`, stores credentials at
+`/data/asr_credentials.json`, and includes FFmpeg with the `libopus` encoder.
+The server listens on all container interfaces, while the example publishes it
+only on the host loopback interface.
+
+For the hardened Compose configuration:
+
+```bash
+cp .env.example .env
+# Set DOUBAO_ASR_API_KEY in .env when clients require authentication.
+docker compose up -d
+docker compose ps
+curl --fail http://127.0.0.1:8000/healthz
+```
+
+Compose uses a read-only root filesystem, a bounded temporary filesystem for
+audio processing, drops Linux capabilities, and persists credentials in the
+`doubao-asr-data` volume. Upgrade without discarding the credentials:
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+To build the same image locally:
+
+```bash
+docker build --build-arg VERSION=dev -t doubao-asr:dev .
+```
+
 ## CLI
 
 Transcribe the first audio stream in a local audio or video file:
@@ -162,6 +204,21 @@ Remote `audio_url` requests are intentionally allowed to reach localhost,
 private networks, link-local addresses, and other HTTP(S) destinations. This is
 an SSRF capability. Do not bind the server to a public interface without a
 strong `DOUBAO_ASR_API_KEY` and appropriate reverse-proxy or firewall controls.
+
+## Releases
+
+Releases are prepared automatically from Conventional Commit messages. A
+`fix:` commit requests a patch release, `feat:` requests a minor release, and a
+breaking change requests a major release. Release Please opens or updates a
+Release PR; merging that PR creates the GitHub Release and publishes:
+
+- GHCR tags `X.Y.Z`, `X.Y`, and `latest` for amd64 and arm64
+- static musl CLI and server archives for x86_64 and aarch64
+- `SHA256SUMS`, an image SBOM, and build provenance attestations
+
+Downloaded binaries still require FFmpeg with `libopus` installed on the host.
+The release workflow also has a manual recovery input for rebuilding an
+existing `vX.Y.Z` release if artifact publication is interrupted.
 
 ## Rust SDK
 

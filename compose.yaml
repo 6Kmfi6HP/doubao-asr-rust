@@ -1,0 +1,29 @@
+services:
+  doubao-asr:
+    image: ${DOUBAO_ASR_IMAGE:-ghcr.io/6kmfi6hp/doubao-asr-rust:latest}
+    restart: unless-stopped
+    init: true
+    ports:
+      - "${DOUBAO_ASR_BIND:-127.0.0.1}:${DOUBAO_ASR_PORT:-8000}:8000"
+    environment:
+      DOUBAO_ASR_LISTEN: 0.0.0.0:8000
+      DOUBAO_ASR_CREDENTIALS: /data/asr_credentials.json
+      DOUBAO_ASR_API_KEY: ${DOUBAO_ASR_API_KEY:-}
+      DOUBAO_ASR_MODEL: ${DOUBAO_ASR_MODEL:-doubao-asr}
+      DOUBAO_ASR_MAX_CONCURRENCY: ${DOUBAO_ASR_MAX_CONCURRENCY:-2}
+      DOUBAO_ASR_REQUEST_TIMEOUT_SECS: ${DOUBAO_ASR_REQUEST_TIMEOUT_SECS:-1800}
+      DOUBAO_ASR_CREDENTIAL_REFRESH_SECS: ${DOUBAO_ASR_CREDENTIAL_REFRESH_SECS:-21600}
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - doubao-asr-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+
+volumes:
+  doubao-asr-data:

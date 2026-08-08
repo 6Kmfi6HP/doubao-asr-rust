@@ -1,0 +1,11 @@
+.git
+.github
+target
+.env
+.env.*
+!.env.example
+asr_credentials.json
+*.credentials.json
+*_credentials.json
+*.tmp
+.DS_Store
