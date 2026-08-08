@@ -1,3 +1,5 @@
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 # doubao-asr-rust
 
 Unofficial asynchronous Rust SDK, CLI, and OpenAI-compatible HTTP server for

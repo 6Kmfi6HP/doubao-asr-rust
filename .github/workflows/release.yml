@@ -92,6 +92,47 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+      - name: Annotate release with Chinese notes
+        if: steps.release.outputs.release_created == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag_name }}
+          VERSION: ${{ steps.release.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          english=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body --jq .body)
+          cat > notes-body.txt <<'NOTES'
+          ## doubao-asr-rust v__VERSION__ — 发布说明
+
+          非官方豆包 IME 语音识别（Doubao IME）Rust 工具集：异步 SDK、命令行工具与 OpenAI
+          兼容的 `/v1/chat/completions` HTTP 服务。每个请求恰好识别一个音频部分，
+          同时支持 `input_audio`（base64 WAV/MP3）与 `audio_url`（HTTP(S) URL 或 data URL）。
+
+          ### 安装
+
+          Docker（amd64 / arm64 多架构镜像）：
+
+          ```bash
+          docker pull ghcr.io/6kmfi6hp/doubao-asr-rust:__VERSION__
+          ```
+
+          静态 musl 二进制（宿主机需自行安装带 `libopus` 的 FFmpeg）：
+
+          - `doubao-asr-v__VERSION__-linux-x86_64-musl.tar.gz`
+          - `doubao-asr-v__VERSION__-linux-aarch64-musl.tar.gz`
+
+          完整中文文档见仓库 [README.zh-CN.md](https://github.com/6Kmfi6HP/doubao-asr-rust/blob/main/README.zh-CN.md)。
+          NOTES
+          sed -i "s/__VERSION__/${VERSION}/g" notes-body.txt
+          {
+            cat notes-body.txt
+            printf '\n---\n\n'
+            printf '<details>\n<summary>English changelog（英文变更记录）</summary>\n\n'
+            printf '%s\n' "$english"
+            printf '\n</details>\n'
+          } > notes-body-full.txt
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file notes-body-full.txt
 
   release-info:
     name: Resolve release
@@ -189,7 +230,7 @@ jobs:
           package="doubao-asr-v${VERSION}-linux-${ASSET_ARCH}-musl"
           mkdir "$package"
           install -m 0755 dist/doubao-asr dist/doubao-asr-server "$package/"
-          install -m 0644 README.md LICENSE "$package/"
+          install -m 0644 README.md README.zh-CN.md LICENSE "$package/"
           tar -czf "${package}.tar.gz" "$package"
       - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
