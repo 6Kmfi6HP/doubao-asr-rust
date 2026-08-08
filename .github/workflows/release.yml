@@ -154,7 +154,7 @@ jobs:
 
   binaries:
     name: Binary (${{ matrix.asset_arch }})
-    if: needs.release-info.outputs.publish == 'true'
+    if: github.event_name == 'workflow_dispatch' || needs.release-info.outputs.publish == 'true'
     needs: release-info
     runs-on: ubuntu-latest
     permissions:
@@ -199,7 +199,7 @@ jobs:
 
   image:
     name: Container image
-    if: needs.release-info.outputs.publish == 'true'
+    if: github.event_name == 'workflow_dispatch' || needs.release-info.outputs.publish == 'true'
     needs: release-info
     runs-on: ubuntu-latest
     permissions:
@@ -251,7 +251,7 @@ jobs:
 
   release-assets:
     name: Release assets
-    if: needs.release-info.outputs.publish == 'true'
+    if: github.event_name == 'workflow_dispatch' || needs.release-info.outputs.publish == 'true'
     needs:
       - release-info
       - binaries
