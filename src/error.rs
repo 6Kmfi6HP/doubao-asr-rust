@@ -8,6 +8,8 @@ pub enum Error {
     NoSpeech,
     #[error("Doubao did not provide a routable ASR device")]
     Unroutable,
+    #[error("Doubao ASR rejected the session (code {0})")]
+    ProviderRejected(u64),
     #[error("operation was cancelled or timed out")]
     Timeout,
     #[error(transparent)]
@@ -18,8 +20,8 @@ impl Error {
     pub(crate) fn msg(value: impl Into<String>) -> Self {
         Self::Message(value.into())
     }
-    pub(crate) fn is_unroutable(&self) -> bool {
-        matches!(self, Self::Unroutable)
+    pub(crate) fn should_refresh_credentials(&self) -> bool {
+        matches!(self, Self::Unroutable | Self::ProviderRejected(_))
     }
 }
 

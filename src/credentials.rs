@@ -1,4 +1,7 @@
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reqwest::{Client, Response};
@@ -23,6 +26,10 @@ pub(crate) struct Credentials {
     pub(crate) openudid: String,
     pub(crate) clientudid: String,
     pub(crate) token: String,
+    #[serde(default)]
+    pub(crate) refreshed_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) expires_at: Option<u64>,
 }
 
 impl std::fmt::Debug for Credentials {
@@ -35,6 +42,8 @@ impl std::fmt::Debug for Credentials {
             .field("openudid", &self.openudid)
             .field("clientudid", &self.clientudid)
             .field("token", &"[REDACTED]")
+            .field("refreshed_at", &self.refreshed_at)
+            .field("expires_at", &self.expires_at)
             .finish()
     }
 }
@@ -48,6 +57,8 @@ impl Credentials {
             openudid: hex(&rand::random::<[u8; 8]>()),
             clientudid: Uuid::new_v4().to_string(),
             token: String::new(),
+            refreshed_at: 0,
+            expires_at: None,
         }
     }
 
@@ -64,6 +75,8 @@ impl Credentials {
             cdid: "00000000-0000-4000-8000-000000000000".into(),
             openudid: "0000000000000000".into(),
             clientudid: "00000000-0000-4000-8000-000000000000".into(),
+            refreshed_at: unix_seconds(),
+            expires_at: None,
         }
     }
 
@@ -154,7 +167,67 @@ impl Credentials {
             .filter(|value| !value.is_empty())
             .ok_or_else(|| Error::msg("Doubao ASR token response was invalid"))?;
         self.token = token.to_owned();
+        self.refreshed_at = unix_seconds();
+        // The observed settings response exposes no expiry or TTL field.
+        self.expires_at = None;
         Ok(())
+    }
+
+    pub(crate) fn refresh_due_at(&self, fallback_interval: Duration) -> u64 {
+        let fallback = self
+            .refreshed_at
+            .saturating_add(fallback_interval.as_secs());
+        let Some(expires_at) = self.expires_at else {
+            return fallback;
+        };
+        let lifetime = expires_at.saturating_sub(self.refreshed_at);
+        let lead = if lifetime < 20 * 60 {
+            lifetime / 2
+        } else {
+            10 * 60
+        };
+        expires_at.saturating_sub(lead)
+    }
+}
+
+pub(crate) type CredentialFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Credentials>> + Send + 'a>>;
+
+pub(crate) trait CredentialProvider: Send + Sync {
+    fn register(&self) -> CredentialFuture<'_>;
+    fn refresh<'a>(&'a self, current: &'a Credentials) -> CredentialFuture<'a>;
+}
+
+pub(crate) struct HttpCredentialProvider {
+    client: Client,
+}
+
+impl HttpCredentialProvider {
+    pub(crate) fn build() -> Result<Arc<dyn CredentialProvider>> {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(20))
+            .build()
+            .map_err(|_| Error::msg("could not prepare Doubao credential requests"))?;
+        Ok(Arc::new(Self { client }))
+    }
+}
+
+impl CredentialProvider for HttpCredentialProvider {
+    fn register(&self) -> CredentialFuture<'_> {
+        Box::pin(async {
+            let mut credentials = Credentials::new();
+            credentials.register_device(&self.client).await?;
+            credentials.fetch_token(&self.client).await?;
+            Ok(credentials)
+        })
+    }
+
+    fn refresh<'a>(&'a self, current: &'a Credentials) -> CredentialFuture<'a> {
+        Box::pin(async {
+            let mut candidate = current.clone();
+            candidate.fetch_token(&self.client).await?;
+            Ok(candidate)
+        })
     }
 }
 
@@ -249,17 +322,6 @@ async fn write_and_replace(temporary: &Path, destination: &Path, data: &[u8]) ->
     Ok(())
 }
 
-pub(crate) async fn register() -> Result<Credentials> {
-    let client = Client::builder()
-        .timeout(Duration::from_secs(20))
-        .build()
-        .map_err(|_| Error::msg("could not prepare Doubao device registration"))?;
-    let mut credentials = Credentials::new();
-    credentials.register_device(&client).await?;
-    credentials.fetch_token(&client).await?;
-    Ok(credentials)
-}
-
 fn device_url(base: &str, credentials: &Credentials, include_device_id: bool) -> Result<Url> {
     let mut url = Url::parse(base).map_err(|_| Error::msg("could not prepare Doubao request"))?;
     let rticket = unix_millis().to_string();
@@ -318,6 +380,13 @@ fn unix_millis() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+pub(crate) fn unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -412,6 +481,28 @@ mod tests {
         assert_eq!(credentials.openudid.len(), 16);
         assert_eq!(credentials.cdid.len(), 36);
         assert_eq!(credentials.clientudid.len(), 36);
+    }
+
+    #[test]
+    fn refresh_deadline_uses_expiry_margin_or_fallback_interval() {
+        let mut credentials = Credentials::for_test("1", "2", "token");
+        credentials.refreshed_at = 1_000;
+        assert_eq!(
+            credentials.refresh_due_at(Duration::from_secs(6 * 60 * 60)),
+            22_600
+        );
+
+        credentials.expires_at = Some(4_600);
+        assert_eq!(
+            credentials.refresh_due_at(Duration::from_secs(6 * 60 * 60)),
+            4_000
+        );
+
+        credentials.expires_at = Some(1_600);
+        assert_eq!(
+            credentials.refresh_due_at(Duration::from_secs(6 * 60 * 60)),
+            1_300
+        );
     }
 
     #[test]

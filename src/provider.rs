@@ -105,18 +105,7 @@ impl ProviderClient {
                         }
                     }
                     "TaskFailed" | "SessionFailed" => {
-                        let error = if frame
-                            .status_text
-                            .to_ascii_lowercase()
-                            .contains("service discovery failure")
-                        {
-                            Error::Unroutable
-                        } else {
-                            Error::msg(format!(
-                                "Doubao ASR rejected the session (code {})",
-                                frame.status_code
-                            ))
-                        };
+                        let error = provider_rejection(frame.status_code, &frame.status_text);
                         if tx.send(Event::Error(error)).await.is_err() {
                             return;
                         }
@@ -250,6 +239,17 @@ impl ProviderClient {
     }
 }
 
+fn provider_rejection(status_code: u64, status_text: &str) -> Error {
+    if status_text
+        .to_ascii_lowercase()
+        .contains("service discovery failure")
+    {
+        Error::Unroutable
+    } else {
+        Error::ProviderRejected(status_code)
+    }
+}
+
 #[derive(Default)]
 struct TextAccumulator {
     final_parts: Vec<String>,
@@ -369,5 +369,17 @@ mod tests {
             final_result: false,
         });
         assert_eq!(a.text(), "临时结果");
+    }
+
+    #[test]
+    fn provider_rejections_are_refreshable() {
+        assert!(matches!(
+            provider_rejection(500, "service discovery failure"),
+            Error::Unroutable
+        ));
+        assert!(matches!(
+            provider_rejection(401, "token expired"),
+            Error::ProviderRejected(401)
+        ));
     }
 }

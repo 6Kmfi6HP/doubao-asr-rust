@@ -14,6 +14,7 @@ mod sami;
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 use tokio::sync::Mutex;
 
@@ -37,6 +38,7 @@ pub struct ClientBuilder {
     credentials_path: Option<PathBuf>,
     punctuation: bool,
     upload_speed: f64,
+    credential_refresh_interval: Option<Duration>,
 }
 
 impl Default for ClientBuilder {
@@ -45,6 +47,7 @@ impl Default for ClientBuilder {
             credentials_path: None,
             punctuation: true,
             upload_speed: 1.0,
+            credential_refresh_interval: None,
         }
     }
 }
@@ -65,6 +68,11 @@ impl ClientBuilder {
         self.upload_speed = speed;
         self
     }
+    /// Enables time-based credential refresh. Provider rejection recovery is always enabled.
+    pub fn credential_refresh_interval(mut self, interval: Duration) -> Self {
+        self.credential_refresh_interval = (!interval.is_zero()).then_some(interval);
+        self
+    }
     /// Validates options and builds a reusable, concurrency-safe client. No network I/O occurs.
     pub fn build(self) -> Result<Client> {
         if !(self.upload_speed > 0.0 && self.upload_speed <= 4.0) {
@@ -79,15 +87,18 @@ impl ClientBuilder {
             Some(path) => absolute_path(&path)?,
             None => credentials::default_path()?,
         };
+        let credential_provider = credentials::HttpCredentialProvider::build()?;
         Ok(Client {
             inner: Arc::new(Inner {
                 options: Options {
                     credentials_path: path,
                     punctuation: self.punctuation,
                     speed: self.upload_speed,
+                    credential_refresh_interval: self.credential_refresh_interval,
                 },
                 credential_state: Mutex::new(CredentialState::default()),
                 refresh: Mutex::new(()),
+                credential_provider,
             }),
         })
     }
@@ -101,17 +112,21 @@ struct Inner {
     options: Options,
     credential_state: Mutex<CredentialState>,
     refresh: Mutex<()>,
+    credential_provider: Arc<dyn credentials::CredentialProvider>,
 }
 struct Options {
     credentials_path: PathBuf,
     punctuation: bool,
     speed: f64,
+    credential_refresh_interval: Option<Duration>,
 }
 #[derive(Default)]
 struct CredentialState {
     loaded: bool,
     credentials: Option<Arc<credentials::Credentials>>,
     dirty: bool,
+    refresh_failures: usize,
+    retry_after: u64,
 }
 
 impl Client {
@@ -125,6 +140,9 @@ impl Client {
     /// Transcribes the first audio stream of a local media file.
     pub async fn transcribe_file(&self, input: impl AsRef<Path>) -> Result<Transcript> {
         let path = validate_input(input.as_ref()).await?;
+        // Proactive maintenance must never make a request fail while the old
+        // credential may still be accepted by the provider.
+        let _ = self.refresh_credentials_if_due().await;
         let credentials = self.credentials_for_use().await?;
         match provider::transcribe_file(
             &path,
@@ -138,10 +156,56 @@ impl Client {
                 self.persist_credentials(&credentials).await?;
                 public_transcript(result)
             }
-            Err(error) if error.is_unroutable() => {
+            Err(error) if error.should_refresh_credentials() => {
                 self.refresh_and_transcribe(&path, credentials).await
             }
             Err(error) => Err(error),
+        }
+    }
+
+    /// Refreshes the current token when its configured deadline has elapsed.
+    ///
+    /// Returns `true` when a fresh token was installed. A disabled interval,
+    /// a future deadline, or an active failure backoff returns `false`.
+    pub async fn refresh_credentials_if_due(&self) -> Result<bool> {
+        let Some(interval) = self.inner.options.credential_refresh_interval else {
+            return Ok(false);
+        };
+        let _refresh = self.inner.refresh.lock().await;
+        let current = self.credentials_for_use().await?;
+        let now = credentials::unix_seconds();
+        {
+            let state = self.inner.credential_state.lock().await;
+            if state.retry_after > now || current.refresh_due_at(interval) > now {
+                return Ok(false);
+            }
+        }
+
+        match self.inner.credential_provider.refresh(&current).await {
+            Ok(candidate) => {
+                let candidate = Arc::new(candidate);
+                let mut state = self.inner.credential_state.lock().await;
+                if !state
+                    .credentials
+                    .as_ref()
+                    .is_some_and(|value| Arc::ptr_eq(value, &current))
+                {
+                    return Ok(false);
+                }
+                state.credentials = Some(candidate.clone());
+                state.dirty = true;
+                state.refresh_failures = 0;
+                state.retry_after = 0;
+                drop(state);
+                self.persist_credentials(&candidate).await?;
+                Ok(true)
+            }
+            Err(error) => {
+                let mut state = self.inner.credential_state.lock().await;
+                state.refresh_failures = state.refresh_failures.saturating_add(1);
+                state.retry_after = now.saturating_add(refresh_backoff(state.refresh_failures));
+                Err(error)
+            }
         }
     }
 
@@ -154,7 +218,7 @@ impl Client {
             state.loaded = true;
         }
         if state.credentials.is_none() {
-            state.credentials = Some(Arc::new(credentials::register().await?));
+            state.credentials = Some(Arc::new(self.inner.credential_provider.register().await?));
             state.dirty = true;
         }
         Ok(state.credentials.as_ref().unwrap().clone())
@@ -193,13 +257,12 @@ impl Client {
                     self.persist_credentials(&current).await?;
                     return public_transcript(result);
                 }
-                Err(error) if error.is_unroutable() => {}
+                Err(error) if error.should_refresh_credentials() => {}
                 Err(error) => return Err(error),
             }
         }
-        let mut last = Error::Unroutable;
-        for _ in 0..2 {
-            let candidate = Arc::new(credentials::register().await?);
+        if let Ok(candidate) = self.inner.credential_provider.refresh(&current).await {
+            let candidate = Arc::new(candidate);
             match provider::transcribe_file(
                 path,
                 &candidate,
@@ -209,25 +272,46 @@ impl Client {
             .await
             {
                 Ok(result) => {
-                    let mut state = self.inner.credential_state.lock().await;
-                    state.credentials = Some(candidate.clone());
-                    state.loaded = true;
-                    state.dirty = true;
-                    drop(state);
-                    self.persist_credentials(&candidate).await?;
+                    self.activate_credentials(candidate.clone()).await?;
                     return public_transcript(result);
                 }
-                Err(error) => {
-                    let stop = !error.is_unroutable();
-                    last = error;
-                    if stop {
-                        break;
-                    }
-                }
+                Err(error) if error.should_refresh_credentials() => {}
+                Err(error) => return Err(error),
             }
         }
-        Err(last)
+
+        let candidate = Arc::new(self.inner.credential_provider.register().await?);
+        match provider::transcribe_file(
+            path,
+            &candidate,
+            self.inner.options.punctuation,
+            self.inner.options.speed,
+        )
+        .await
+        {
+            Ok(result) => {
+                self.activate_credentials(candidate.clone()).await?;
+                public_transcript(result)
+            }
+            Err(error) => Err(error),
+        }
     }
+
+    async fn activate_credentials(&self, candidate: Arc<credentials::Credentials>) -> Result<()> {
+        let mut state = self.inner.credential_state.lock().await;
+        state.credentials = Some(candidate.clone());
+        state.loaded = true;
+        state.dirty = true;
+        state.refresh_failures = 0;
+        state.retry_after = 0;
+        drop(state);
+        self.persist_credentials(&candidate).await
+    }
+}
+
+fn refresh_backoff(failures: usize) -> u64 {
+    const BACKOFFS: [u64; 4] = [60, 5 * 60, 15 * 60, 60 * 60];
+    BACKOFFS[failures.saturating_sub(1).min(BACKOFFS.len() - 1)]
 }
 
 fn public_transcript(result: provider::ProviderTranscript) -> Result<Transcript> {
@@ -268,6 +352,75 @@ async fn validate_input(path: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    struct FakeCredentialProvider {
+        refreshes: AtomicUsize,
+        registrations: AtomicUsize,
+        fail_refresh: AtomicBool,
+    }
+
+    impl FakeCredentialProvider {
+        fn new(fail_refresh: bool) -> Self {
+            Self {
+                refreshes: AtomicUsize::new(0),
+                registrations: AtomicUsize::new(0),
+                fail_refresh: AtomicBool::new(fail_refresh),
+            }
+        }
+    }
+
+    impl credentials::CredentialProvider for FakeCredentialProvider {
+        fn register(&self) -> credentials::CredentialFuture<'_> {
+            self.registrations.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Err(Error::msg("unexpected registration")) })
+        }
+
+        fn refresh<'a>(
+            &'a self,
+            current: &'a credentials::Credentials,
+        ) -> credentials::CredentialFuture<'a> {
+            self.refreshes.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                if self.fail_refresh.load(Ordering::SeqCst) {
+                    return Err(Error::msg("refresh failed"));
+                }
+                let mut candidate = current.clone();
+                candidate.token = "refreshed-token".into();
+                candidate.refreshed_at = credentials::unix_seconds();
+                Ok(candidate)
+            })
+        }
+    }
+
+    fn client_with_provider(
+        path: PathBuf,
+        interval: Option<Duration>,
+        provider: Arc<dyn credentials::CredentialProvider>,
+    ) -> Client {
+        Client {
+            inner: Arc::new(Inner {
+                options: Options {
+                    credentials_path: path,
+                    punctuation: true,
+                    speed: 1.0,
+                    credential_refresh_interval: interval,
+                },
+                credential_state: Mutex::new(CredentialState::default()),
+                refresh: Mutex::new(()),
+                credential_provider: provider,
+            }),
+        }
+    }
+
+    async fn write_legacy_credentials(path: &Path) {
+        tokio::fs::write(
+            path,
+            br#"{"device_id":"1","install_id":"2","cdid":"c","openudid":"o","clientudid":"u","token":"old-token"}"#,
+        )
+        .await
+        .unwrap();
+    }
     #[test]
     fn builder_defaults_and_validation() {
         let c = Client::builder()
@@ -303,5 +456,74 @@ mod tests {
         })
         .unwrap_err();
         assert!(matches!(err, Error::NoSpeech));
+    }
+
+    #[tokio::test]
+    async fn legacy_credentials_refresh_once_across_concurrent_callers() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("credentials.json");
+        write_legacy_credentials(&path).await;
+        let provider = Arc::new(FakeCredentialProvider::new(false));
+        let client = client_with_provider(
+            path.clone(),
+            Some(Duration::from_secs(6 * 60 * 60)),
+            provider.clone(),
+        );
+
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let client = client.clone();
+            tasks.push(tokio::spawn(async move {
+                client.refresh_credentials_if_due().await.unwrap()
+            }));
+        }
+        let mut refreshed = 0;
+        for task in tasks {
+            refreshed += usize::from(task.await.unwrap());
+        }
+
+        assert_eq!(refreshed, 1);
+        assert_eq!(provider.refreshes.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.registrations.load(Ordering::SeqCst), 0);
+        let stored = credentials::load(&path).await.unwrap().unwrap();
+        assert_eq!(stored.token, "refreshed-token");
+        assert!(stored.refreshed_at > 0);
+    }
+
+    #[tokio::test]
+    async fn refresh_failure_retains_credentials_and_starts_backoff() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("credentials.json");
+        write_legacy_credentials(&path).await;
+        let provider = Arc::new(FakeCredentialProvider::new(true));
+        let client = client_with_provider(
+            path.clone(),
+            Some(Duration::from_secs(6 * 60 * 60)),
+            provider.clone(),
+        );
+
+        assert!(client.refresh_credentials_if_due().await.is_err());
+        assert!(!client.refresh_credentials_if_due().await.unwrap());
+        assert_eq!(provider.refreshes.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.registrations.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            credentials::load(&path).await.unwrap().unwrap().token,
+            "old-token"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_proactive_refresh_does_not_load_or_refresh_credentials() {
+        let directory = tempfile::tempdir().unwrap();
+        let provider = Arc::new(FakeCredentialProvider::new(false));
+        let client = client_with_provider(
+            directory.path().join("missing.json"),
+            None,
+            provider.clone(),
+        );
+
+        assert!(!client.refresh_credentials_if_due().await.unwrap());
+        assert_eq!(provider.refreshes.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.registrations.load(Ordering::SeqCst), 0);
     }
 }
