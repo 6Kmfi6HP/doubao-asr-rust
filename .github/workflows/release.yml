@@ -171,8 +171,8 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ needs.release-info.outputs.tag }}
-      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
       - name: Export static binaries
         env:
           PLATFORM: ${{ matrix.platform }}
@@ -185,13 +185,13 @@ jobs:
         run: |
           set -euo pipefail
           file dist/doubao-asr dist/doubao-asr-server | tee binary-types.txt
-          grep -q 'statically linked' binary-types.txt
+          grep -Eq 'static(-pie)? linked|statically linked' binary-types.txt
           package="doubao-asr-v${VERSION}-linux-${ASSET_ARCH}-musl"
           mkdir "$package"
           install -m 0755 dist/doubao-asr dist/doubao-asr-server "$package/"
           install -m 0644 README.md LICENSE "$package/"
           tar -czf "${package}.tar.gz" "$package"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: binaries-${{ matrix.asset_arch }}
           path: doubao-asr-v*-linux-${{ matrix.asset_arch }}-musl.tar.gz
@@ -211,15 +211,15 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ needs.release-info.outputs.tag }}
-      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - id: metadata
-        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
           images: ghcr.io/6kmfi6hp/doubao-asr-rust
           tags: |
@@ -227,7 +227,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}},value=${{ needs.release-info.outputs.tag }}
             type=raw,value=latest
       - id: build
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
           target: runtime
@@ -243,7 +243,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=release-image
           provenance: mode=max
           sbom: true
-      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+      - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
         with:
           subject-name: ghcr.io/6kmfi6hp/doubao-asr-rust
           subject-digest: ${{ steps.build.outputs.digest }}
@@ -259,7 +259,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           pattern: binaries-*
           path: dist
